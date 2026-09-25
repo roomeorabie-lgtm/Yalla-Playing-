@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { AnswersMap, CategoryKey, RoomState } from '../types/game.ts';
 import { sounds } from '../utils/sound.ts';
-import { supabase, isSupabaseConfigured } from '../utils/supabase.ts';
+import { supabase, isSupabaseConfigured, supabaseCreateRoom, supabaseJoinRoom } from '../utils/supabase.ts';
 
 export function useGameSocket() {
   const [roomState, setRoomState] = useState<RoomState | null>(null);
@@ -221,6 +221,7 @@ export function useGameSocket() {
 
     // 1. Try WebSocket if connected
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      console.log('Dispatching CREATE_ROOM via WebSocket...');
       socketRef.current.send(JSON.stringify({
         type: 'CREATE_ROOM',
         payload: { hostName, avatar, targetScore }
@@ -230,6 +231,7 @@ export function useGameSocket() {
 
     // 2. REST API execution
     try {
+      console.log('Sending room creation request to /api/rooms/create...');
       const res = await fetch('/api/rooms/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -237,11 +239,18 @@ export function useGameSocket() {
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'تعذر إنشاء الغرفة');
+        let errDetail = `خطأ في الخادم (${res.status} ${res.statusText})`;
+        try {
+          const errData = await res.json();
+          if (errData.error) errDetail = errData.error;
+        } catch {}
+        console.error('❌ Room creation failed HTTP error:', res.status, res.statusText, errDetail);
+        throw new Error(errDetail);
       }
 
       const data = await res.json();
+      console.log('✅ Room created successfully:', data.roomCode, 'Host ID:', data.playerId);
+
       setPlayerId(data.playerId);
       setRoomCode(data.roomCode);
       setIsHost(true);
@@ -249,9 +258,23 @@ export function useGameSocket() {
       sessionStorage.setItem('yalla_playing_player_id', data.playerId);
       sessionStorage.setItem('yalla_playing_room_code', data.roomCode);
 
+      // Mirror to Supabase if configured
+      if (isSupabaseConfigured) {
+        supabaseCreateRoom(data.roomCode, {
+          id: data.playerId,
+          name: hostName,
+          avatar: avatar,
+          isHost: true,
+          isConnected: true,
+          totalScore: 0,
+          hasSubmitted: false
+        }, targetScore).catch(err => console.warn('Supabase mirror note:', err));
+      }
+
       startSSEListener(data.roomCode, data.playerId);
       connectWebSocket(data.roomCode, data.playerId);
     } catch (err: any) {
+      console.error('❌ Detailed create room error:', err);
       setErrorMessage(err?.message || 'فشل إنشاء الغرفة. يرجى المحاولة مرة أخرى.');
       sounds.playInvalid();
     }
@@ -267,6 +290,7 @@ export function useGameSocket() {
 
     // 1. Try WebSocket if open
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      console.log('Dispatching JOIN_ROOM via WebSocket...');
       socketRef.current.send(JSON.stringify({
         type: 'JOIN_ROOM',
         payload: { roomCode: cleanCode, playerName, avatar }
@@ -276,6 +300,7 @@ export function useGameSocket() {
 
     // 2. REST API execution
     try {
+      console.log(`Sending join room request to /api/rooms/${cleanCode}/join...`);
       const res = await fetch(`/api/rooms/${cleanCode}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -283,20 +308,41 @@ export function useGameSocket() {
       });
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'رقم الغرفة غير صحيح أو الغرفة غير موجودة');
+        let errDetail = 'رقم الغرفة غير صحيح أو الغرفة غير موجودة';
+        try {
+          const errData = await res.json();
+          if (errData.error) errDetail = errData.error;
+        } catch {}
+        console.error('❌ Join room failed HTTP error:', res.status, res.statusText, errDetail);
+        throw new Error(errDetail);
       }
 
       const data = await res.json();
+      console.log('✅ Joined room successfully:', data.roomCode, 'Player ID:', data.playerId);
+
       setPlayerId(data.playerId);
       setRoomCode(data.roomCode);
       setIsHost(data.isHost);
       setRoomState(data.roomState);
       sessionStorage.setItem('yalla_playing_player_id', data.playerId);
 
+      // Mirror to Supabase if configured
+      if (isSupabaseConfigured) {
+        supabaseJoinRoom(data.roomCode, {
+          id: data.playerId,
+          name: playerName,
+          avatar: avatar,
+          isHost: data.isHost,
+          isConnected: true,
+          totalScore: 0,
+          hasSubmitted: false
+        }).catch(err => console.warn('Supabase mirror join note:', err));
+      }
+
       startSSEListener(data.roomCode, data.playerId);
       connectWebSocket(data.roomCode, data.playerId);
     } catch (err: any) {
+      console.error('❌ Detailed join room error:', err);
       setErrorMessage(err?.message || 'تعذر الانضمام للغرفة.');
       sounds.playInvalid();
     }

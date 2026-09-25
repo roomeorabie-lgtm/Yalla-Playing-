@@ -1,13 +1,15 @@
 import React from 'react';
-import { Volume2, VolumeX, LogOut, Users } from 'lucide-react';
+import { Volume2, VolumeX, LogOut, Users, Database } from 'lucide-react';
 import { sounds } from '../utils/sound.ts';
 import { RoomState } from '../types/game.ts';
+import { isSupabaseConfigured } from '../utils/supabase.ts';
 
 interface HeaderProps {
   roomState: RoomState | null;
   onLeaveRoom: () => void;
   soundEnabled: boolean;
   onToggleSound: () => void;
+  onOpenSupabaseConfig?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -15,6 +17,7 @@ export const Header: React.FC<HeaderProps> = ({
   onLeaveRoom,
   soundEnabled,
   onToggleSound,
+  onOpenSupabaseConfig,
 }) => {
   return (
     <header className="w-full bg-white/80 backdrop-blur-md border-b border-rose-100 sticky top-0 z-40 px-4 py-3">
@@ -38,7 +41,21 @@ export const Header: React.FC<HeaderProps> = ({
         )}
 
         {/* Actions Zone */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          {onOpenSupabaseConfig && (
+            <button
+              onClick={onOpenSupabaseConfig}
+              title={isSupabaseConfigured ? 'قاعدة بيانات Supabase: متصلة' : 'إعدادات قاعدة بيانات Supabase'}
+              className="p-2 text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 rounded-xl transition-colors cursor-pointer relative"
+              aria-label="قاعدة البيانات"
+            >
+              <Database className="w-4 h-4 text-emerald-600" />
+              {isSupabaseConfigured && (
+                <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 bg-emerald-500 rounded-full" />
+              )}
+            </button>
+          )}
+
           <button
             onClick={() => {
               sounds.enabled = !soundEnabled;

@@ -14,6 +14,7 @@ import { ChoosingLetterScreen } from './components/ChoosingLetterScreen.tsx';
 import { PlayingScreen } from './components/PlayingScreen.tsx';
 import { RoundResultsScreen } from './components/RoundResultsScreen.tsx';
 import { GameOverScreen } from './components/GameOverScreen.tsx';
+import { SupabaseConfigModal } from './components/SupabaseConfigModal.tsx';
 import { sounds } from './utils/sound.ts';
 import { WifiOff, AlertTriangle } from 'lucide-react';
 
@@ -40,6 +41,7 @@ export default function App() {
 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [isJoinOpen, setIsJoinOpen] = useState(false);
+  const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
   const [invitedRoomCode, setInvitedRoomCode] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState(true);
 
@@ -74,6 +76,7 @@ export default function App() {
         onLeaveRoom={leaveRoom}
         soundEnabled={soundEnabled}
         onToggleSound={() => setSoundEnabled(!soundEnabled)}
+        onOpenSupabaseConfig={() => setIsSupabaseModalOpen(true)}
       />
 
       {/* Disconnection Warning if server is unreachable */}
@@ -174,6 +177,11 @@ export default function App() {
         onJoin={handleJoinRoom}
         initialRoomCode={invitedRoomCode}
         serverError={errorMessage}
+      />
+
+      <SupabaseConfigModal
+        isOpen={isSupabaseModalOpen}
+        onClose={() => setIsSupabaseModalOpen(false)}
       />
     </div>
   );
