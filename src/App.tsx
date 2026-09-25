@@ -35,6 +35,7 @@ export default function App() {
     hostNextRound,
     restartGame,
     leaveRoom,
+    checkHealth,
   } = useGameSocket();
 
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -75,11 +76,17 @@ export default function App() {
         onToggleSound={() => setSoundEnabled(!soundEnabled)}
       />
 
-      {/* Disconnection Warning if Socket drops */}
+      {/* Disconnection Warning if server is unreachable */}
       {!isConnected && (
-        <div className="w-full bg-amber-500 text-white text-xs py-1.5 px-4 text-center font-bold flex items-center justify-center gap-2">
-          <WifiOff className="w-4 h-4 animate-pulse" />
-          <span>جاري إعادة الاتصال بالخادم لحظياً...</span>
+        <div className="w-full bg-rose-600 text-white text-xs py-2 px-4 text-center font-bold flex items-center justify-center gap-3">
+          <WifiOff className="w-4 h-4 shrink-0" />
+          <span>تعذر الاتصال بالخادم. يرجى التحقق من اتصال الإنترنت أو الضغط لإعادة المحاولة.</span>
+          <button
+            onClick={() => checkHealth()}
+            className="bg-white text-rose-700 px-3 py-1 rounded-lg text-xs font-bold hover:bg-rose-50 cursor-pointer shadow-xs"
+          >
+            إعادة المحاولة
+          </button>
         </div>
       )}
 

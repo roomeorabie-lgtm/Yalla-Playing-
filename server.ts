@@ -52,6 +52,13 @@ const rooms = new Map<string, ServerRoom>();
 // Map ws to { roomCode, playerId }
 const socketMetadata = new WeakMap<WebSocket, { roomCode: string; playerId: string }>();
 
+// SSE clients per room for HTTP streaming fallback
+interface SSEClient {
+  res: express.Response;
+  playerId: string;
+}
+const sseClients = new Map<string, Set<SSEClient>>();
+
 function generateRoomCode(): string {
   let code = '';
   let attempts = 0;
@@ -173,12 +180,13 @@ function calculateRoundScores(room: ServerRoom) {
 }
 
 function getSerializableRoomState(room: ServerRoom): RoomState {
+  const now = Date.now();
   const playersList: Player[] = Array.from(room.players.values()).map(p => ({
     id: p.id,
     name: p.name,
     avatar: p.avatar,
     isHost: p.isHost,
-    isConnected: p.ws !== null && p.ws.readyState === WebSocket.OPEN,
+    isConnected: (p.ws !== null && p.ws.readyState === WebSocket.OPEN) || (now - p.lastActive < 30000),
     totalScore: p.totalScore,
     hasSubmitted: p.submittedAnswers !== null
   }));
@@ -187,7 +195,6 @@ function getSerializableRoomState(room: ServerRoom): RoomState {
   const pickerIndex = room.letterPickerIndex % (playerKeys.length || 1);
   const letterPickerId = playerKeys[pickerIndex] || room.hostId;
 
-  // Find winner if any reached target score
   let winner: Player | null = null;
   const playersOverTarget = playersList.filter(p => p.totalScore >= room.targetScore);
   if (playersOverTarget.length > 0) {
@@ -219,10 +226,259 @@ function broadcastRoom(room: ServerRoom) {
   const state = getSerializableRoomState(room);
   const payload = JSON.stringify({ type: 'ROOM_STATE', payload: state });
 
+  // 1. Broadcast over WebSockets
   for (const player of room.players.values()) {
     if (player.ws && player.ws.readyState === WebSocket.OPEN) {
       player.ws.send(payload);
     }
+  }
+
+  // 2. Broadcast over Server-Sent Events (SSE)
+  const sseSet = sseClients.get(room.code);
+  if (sseSet && sseSet.size > 0) {
+    for (const client of sseSet) {
+      try {
+        client.res.write(`data: ${payload}\n\n`);
+      } catch {
+        sseSet.delete(client);
+      }
+    }
+  }
+}
+
+// Core room action processor (used by both WebSocket and REST API)
+function handleRoomAction(
+  room: ServerRoom, 
+  playerId: string, 
+  type: string, 
+  payload: any
+): { success: boolean; error?: string } {
+  const player = room.players.get(playerId);
+  if (player) {
+    player.lastActive = Date.now();
+  }
+
+  switch (type) {
+    case 'START_GAME': {
+      if (room.hostId !== playerId) {
+        return { success: false, error: 'مالك الغرفة فقط يستطيع بدء اللعبة' };
+      }
+      clearRoomCountdown(room);
+      room.stage = 'CHOOSING_LETTER';
+      room.currentRound = 1;
+      room.letterPickerIndex = 0;
+      room.currentLetter = null;
+      room.usedLetters = [];
+      room.roundScores = {};
+
+      for (const p of room.players.values()) {
+        p.totalScore = 0;
+        p.submittedAnswers = null;
+      }
+
+      broadcastRoom(room);
+      return { success: true };
+    }
+
+    case 'SELECT_LETTER': {
+      if (room.stage !== 'CHOOSING_LETTER') {
+        return { success: false, error: 'ليست مرحلة اختيار الحرف' };
+      }
+      const playerKeys = Array.from(room.players.keys());
+      const currentPickerId = playerKeys[room.letterPickerIndex % playerKeys.length];
+
+      if (playerId !== currentPickerId && playerId !== room.hostId) {
+        return { success: false, error: 'ليس دورك في اختيار الحرف' };
+      }
+
+      const letter = payload?.letter;
+      if (!letter) {
+        return { success: false, error: 'الرجاء اختيار حرف صالح' };
+      }
+
+      clearRoomCountdown(room);
+      room.currentLetter = letter;
+      if (!room.usedLetters.includes(letter)) {
+        room.usedLetters.push(letter);
+      }
+      room.stage = 'PLAYING';
+
+      for (const p of room.players.values()) {
+        p.submittedAnswers = null;
+      }
+
+      broadcastRoom(room);
+      return { success: true };
+    }
+
+    case 'SUBMIT_ANSWERS': {
+      if (room.stage !== 'PLAYING') {
+        return { success: false, error: 'الجولة غير نشطة حالياً' };
+      }
+      if (!player) {
+        return { success: false, error: 'اللاعب غير موجود' };
+      }
+
+      player.submittedAnswers = {
+        name: (payload.answers?.name || '').trim(),
+        animal: (payload.answers?.animal || '').trim(),
+        plant: (payload.answers?.plant || '').trim(),
+        object: (payload.answers?.object || '').trim(),
+        country: (payload.answers?.country || '').trim(),
+      };
+
+      const allSubmitted = Array.from(room.players.values())
+        .every(p => p.submittedAnswers !== null);
+
+      if (allSubmitted) {
+        clearRoomCountdown(room);
+        calculateRoundScores(room);
+        room.stage = 'ROUND_RESULTS';
+        broadcastRoom(room);
+        return { success: true };
+      }
+
+      // Trigger 5-second countdown on first submission
+      if (room.countdownSeconds === null) {
+        room.countdownSeconds = 5;
+        room.firstSubmitterName = player.name;
+        broadcastRoom(room);
+
+        room.countdownTimer = setInterval(() => {
+          if (room.countdownSeconds === null) {
+            if (room.countdownTimer) clearInterval(room.countdownTimer);
+            return;
+          }
+
+          room.countdownSeconds -= 1;
+
+          if (room.countdownSeconds <= 0) {
+            clearRoomCountdown(room);
+
+            // Fill unsubmitted with empty answers
+            for (const p of room.players.values()) {
+              if (p.submittedAnswers === null) {
+                p.submittedAnswers = {
+                  name: '',
+                  animal: '',
+                  plant: '',
+                  object: '',
+                  country: '',
+                };
+              }
+            }
+
+            calculateRoundScores(room);
+            room.stage = 'ROUND_RESULTS';
+            broadcastRoom(room);
+          } else {
+            broadcastRoom(room);
+          }
+        }, 1000);
+      } else {
+        broadcastRoom(room);
+      }
+      return { success: true };
+    }
+
+    case 'HOST_FORCE_END_ROUND': {
+      if (room.hostId !== playerId) {
+        return { success: false, error: 'مالك الغرفة فقط يستطيع إنهاء الجولة' };
+      }
+      clearRoomCountdown(room);
+
+      for (const p of room.players.values()) {
+        if (p.submittedAnswers === null) {
+          p.submittedAnswers = {
+            name: '',
+            animal: '',
+            plant: '',
+            object: '',
+            country: '',
+          };
+        }
+      }
+
+      calculateRoundScores(room);
+      room.stage = 'ROUND_RESULTS';
+      broadcastRoom(room);
+      return { success: true };
+    }
+
+    case 'HOST_ADJUST_SCORE': {
+      if (room.hostId !== playerId) {
+        return { success: false, error: 'مالك الغرفة فقط يستطيع تعديل النقاط' };
+      }
+      const { targetPlayerId, category, newPoints } = payload;
+      const pScore = room.roundScores[targetPlayerId];
+      const targetPlayer = room.players.get(targetPlayerId);
+
+      if (pScore && targetPlayer && [0, 5, 10].includes(newPoints)) {
+        const oldPoints = pScore.answers[category as CategoryKey]?.points || 0;
+        const delta = newPoints - oldPoints;
+        
+        pScore.answers[category as CategoryKey].points = newPoints;
+        pScore.answers[category as CategoryKey].status = 'MANUAL';
+        pScore.answers[category as CategoryKey].reason = `تم التعديل بواسطة المالك (${newPoints > 0 ? '+' + newPoints : 0})`;
+        
+        pScore.roundTotal += delta;
+        targetPlayer.totalScore += delta;
+
+        broadcastRoom(room);
+        return { success: true };
+      }
+      return { success: false, error: 'بيانات التعديل غير صحيحة' };
+    }
+
+    case 'HOST_NEXT_ROUND': {
+      if (room.hostId !== playerId) {
+        return { success: false, error: 'مالك الغرفة فقط يستطيع بدء جولة جديدة' };
+      }
+      clearRoomCountdown(room);
+
+      const hasWinner = Array.from(room.players.values()).some(p => p.totalScore >= room.targetScore);
+      if (hasWinner) {
+        room.stage = 'GAME_OVER';
+        broadcastRoom(room);
+        return { success: true };
+      }
+
+      room.currentRound += 1;
+      room.letterPickerIndex = (room.letterPickerIndex + 1) % (room.players.size || 1);
+      room.currentLetter = null;
+      room.stage = 'CHOOSING_LETTER';
+
+      for (const p of room.players.values()) {
+        p.submittedAnswers = null;
+      }
+
+      broadcastRoom(room);
+      return { success: true };
+    }
+
+    case 'RESTART_GAME': {
+      if (room.hostId !== playerId) {
+        return { success: false, error: 'مالك الغرفة فقط يستطيع إعادة بدء اللعبة' };
+      }
+      clearRoomCountdown(room);
+      room.stage = 'LOBBY';
+      room.currentRound = 1;
+      room.letterPickerIndex = 0;
+      room.currentLetter = null;
+      room.usedLetters = [];
+      room.roundScores = {};
+
+      for (const p of room.players.values()) {
+        p.totalScore = 0;
+        p.submittedAnswers = null;
+      }
+
+      broadcastRoom(room);
+      return { success: true };
+    }
+
+    default:
+      return { success: false, error: 'نوع العملية غير معروف' };
   }
 }
 
@@ -230,11 +486,17 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // API endpoints for room info & verification
+  // 1. Health check
   app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', game: 'Yalla Playing', time: Date.now() });
+    res.json({ 
+      status: 'ok', 
+      game: 'Yalla Playing', 
+      activeRooms: rooms.size,
+      time: Date.now() 
+    });
   });
 
+  // 2. Room check
   app.get('/api/room/:code', (req, res) => {
     const code = req.params.code;
     const room = rooms.get(code);
@@ -246,6 +508,197 @@ async function startServer() {
       targetScore: room.targetScore,
       stage: room.stage,
       playerCount: room.players.size,
+    });
+  });
+
+  // 3. Create room via REST
+  app.post('/api/rooms/create', (req, res) => {
+    try {
+      const { hostName, avatar, targetScore } = req.body || {};
+      const roomCode = generateRoomCode();
+      const hostId = generatePlayerId();
+
+      const hostPlayer: ServerPlayer = {
+        id: hostId,
+        name: (hostName || 'مالك الغرفة').trim(),
+        avatar: avatar || '👑',
+        isHost: true,
+        ws: null,
+        totalScore: 0,
+        submittedAnswers: null,
+        lastActive: Date.now(),
+      };
+
+      const newRoom: ServerRoom = {
+        code: roomCode,
+        targetScore: [150, 250, 450].includes(targetScore) ? targetScore : 150,
+        stage: 'LOBBY',
+        currentRound: 1,
+        hostId,
+        letterPickerIndex: 0,
+        currentLetter: null,
+        usedLetters: [],
+        players: new Map([[hostId, hostPlayer]]),
+        roundScores: {},
+        createdAt: Date.now(),
+        countdownTimer: null,
+        countdownSeconds: null,
+        firstSubmitterName: null,
+      };
+
+      rooms.set(roomCode, newRoom);
+      broadcastRoom(newRoom);
+
+      return res.json({
+        success: true,
+        roomCode,
+        playerId: hostId,
+        isHost: true,
+        roomState: getSerializableRoomState(newRoom),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'فشل إنشاء الغرفة' });
+    }
+  });
+
+  // 4. Join room via REST
+  app.post('/api/rooms/:code/join', (req, res) => {
+    try {
+      const roomCode = req.params.code?.trim();
+      const { playerName, avatar, existingPlayerId } = req.body || {};
+      const room = rooms.get(roomCode);
+
+      if (!room) {
+        return res.status(404).json({ error: 'رقم الغرفة غير صحيح أو الغرفة غير موجودة' });
+      }
+
+      // Reconnect existing player
+      if (existingPlayerId && room.players.has(existingPlayerId)) {
+        const existingPlayer = room.players.get(existingPlayerId)!;
+        existingPlayer.lastActive = Date.now();
+        if (playerName) existingPlayer.name = playerName.trim();
+        if (avatar) existingPlayer.avatar = avatar;
+
+        broadcastRoom(room);
+
+        return res.json({
+          success: true,
+          roomCode: room.code,
+          playerId: existingPlayerId,
+          isHost: existingPlayer.isHost,
+          roomState: getSerializableRoomState(room),
+        });
+      }
+
+      // New player
+      const newPlayerId = generatePlayerId();
+      const newPlayer: ServerPlayer = {
+        id: newPlayerId,
+        name: (playerName || 'لاعب جديد').trim(),
+        avatar: avatar || '🌸',
+        isHost: false,
+        ws: null,
+        totalScore: 0,
+        submittedAnswers: null,
+        lastActive: Date.now(),
+      };
+
+      room.players.set(newPlayerId, newPlayer);
+      broadcastRoom(room);
+
+      return res.json({
+        success: true,
+        roomCode: room.code,
+        playerId: newPlayerId,
+        isHost: false,
+        roomState: getSerializableRoomState(room),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'فشل الانضمام للغرفة' });
+    }
+  });
+
+  // 5. Get current room state
+  app.get('/api/rooms/:code/state', (req, res) => {
+    const roomCode = req.params.code?.trim();
+    const room = rooms.get(roomCode);
+    if (!room) {
+      return res.status(404).json({ error: 'الغرفة غير موجودة' });
+    }
+    return res.json(getSerializableRoomState(room));
+  });
+
+  // 6. Action dispatcher via REST
+  app.post('/api/rooms/:code/action', (req, res) => {
+    try {
+      const roomCode = req.params.code?.trim();
+      const { playerId, action, payload } = req.body || {};
+      const room = rooms.get(roomCode);
+
+      if (!room) {
+        return res.status(404).json({ error: 'الغرفة غير موجودة' });
+      }
+
+      const result = handleRoomAction(room, playerId, action, payload);
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+
+      return res.json({
+        success: true,
+        roomState: getSerializableRoomState(room),
+      });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'فشل تنفيذ العملية' });
+    }
+  });
+
+  // 7. Server-Sent Events (SSE) stream for live real-time sync without WebSocket blockers!
+  app.get('/api/rooms/:code/events', (req, res) => {
+    const roomCode = req.params.code?.trim();
+    const playerId = (req.query.playerId as string) || '';
+    const room = rooms.get(roomCode);
+
+    if (!room) {
+      return res.status(404).end('Room not found');
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
+
+    // Register SSE client
+    if (!sseClients.has(roomCode)) {
+      sseClients.set(roomCode, new Set());
+    }
+    const client: SSEClient = { res, playerId };
+    sseClients.get(roomCode)!.add(client);
+
+    // Update player active timestamp
+    const player = room.players.get(playerId);
+    if (player) {
+      player.lastActive = Date.now();
+    }
+
+    // Send immediate current state
+    const initialState = getSerializableRoomState(room);
+    res.write(`data: ${JSON.stringify({ type: 'ROOM_STATE', payload: initialState })}\n\n`);
+
+    // Ping every 10 seconds to keep connection alive through proxies
+    const pingInterval = setInterval(() => {
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        clearInterval(pingInterval);
+      }
+    }, 10000);
+
+    req.on('close', () => {
+      clearInterval(pingInterval);
+      sseClients.get(roomCode)?.delete(client);
     });
   });
 
@@ -327,7 +780,6 @@ async function startServer() {
               return;
             }
 
-            // Check if reconnecting existing player
             if (existingPlayerId && room.players.has(existingPlayerId)) {
               const existingPlayer = room.players.get(existingPlayerId)!;
               existingPlayer.ws = ws;
@@ -346,7 +798,6 @@ async function startServer() {
               return;
             }
 
-            // New player joining
             const newPlayerId = generatePlayerId();
             const newPlayer: ServerPlayer = {
               id: newPlayerId,
@@ -371,248 +822,22 @@ async function startServer() {
             break;
           }
 
-          case 'START_GAME': {
+          default: {
             const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.hostId !== meta.playerId) return;
-
-            clearRoomCountdown(room);
-            room.stage = 'CHOOSING_LETTER';
-            room.currentRound = 1;
-            room.letterPickerIndex = 0;
-            room.currentLetter = null;
-            room.usedLetters = [];
-            room.roundScores = {};
-
-            // Reset scores & submissions for all players
-            for (const p of room.players.values()) {
-              p.totalScore = 0;
-              p.submittedAnswers = null;
-            }
-
-            broadcastRoom(room);
-            break;
-          }
-
-          case 'SELECT_LETTER': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.stage !== 'CHOOSING_LETTER') return;
-
-            const playerKeys = Array.from(room.players.keys());
-            const currentPickerId = playerKeys[room.letterPickerIndex % playerKeys.length];
-
-            // Only picker or host can select letter
-            if (meta.playerId !== currentPickerId && meta.playerId !== room.hostId) {
-              return;
-            }
-
-            const letter = payload.letter;
-            if (!letter) return;
-
-            clearRoomCountdown(room);
-            room.currentLetter = letter;
-            if (!room.usedLetters.includes(letter)) {
-              room.usedLetters.push(letter);
-            }
-            room.stage = 'PLAYING';
-
-            // Clear previous round submissions
-            for (const p of room.players.values()) {
-              p.submittedAnswers = null;
-            }
-
-            broadcastRoom(room);
-            break;
-          }
-
-          case 'SUBMIT_ANSWERS': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.stage !== 'PLAYING') return;
-
-            const player = room.players.get(meta.playerId);
-            if (!player) return;
-
-            // Record this player's submitted answers
-            player.submittedAnswers = {
-              name: (payload.answers?.name || '').trim(),
-              animal: (payload.answers?.animal || '').trim(),
-              plant: (payload.answers?.plant || '').trim(),
-              object: (payload.answers?.object || '').trim(),
-              country: (payload.answers?.country || '').trim(),
-            };
-
-            // Check if ALL players have submitted
-            const allSubmitted = Array.from(room.players.values())
-              .every(p => p.submittedAnswers !== null);
-
-            if (allSubmitted) {
-              // Immediately finalize round
-              clearRoomCountdown(room);
-              calculateRoundScores(room);
-              room.stage = 'ROUND_RESULTS';
-              broadcastRoom(room);
-              return;
-            }
-
-            // If not all submitted, trigger the 5-second countdown on FIRST submission!
-            if (room.countdownSeconds === null) {
-              room.countdownSeconds = 5;
-              room.firstSubmitterName = player.name;
-              broadcastRoom(room);
-
-              room.countdownTimer = setInterval(() => {
-                if (room.countdownSeconds === null) {
-                  if (room.countdownTimer) clearInterval(room.countdownTimer);
-                  return;
+            if (meta) {
+              const room = rooms.get(meta.roomCode);
+              if (room) {
+                const res = handleRoomAction(room, meta.playerId, type, payload);
+                if (!res.success) {
+                  ws.send(JSON.stringify({
+                    type: 'ERROR',
+                    payload: { message: res.error }
+                  }));
                 }
-
-                room.countdownSeconds -= 1;
-
-                if (room.countdownSeconds <= 0) {
-                  // Timer expired! Finalize round
-                  clearRoomCountdown(room);
-
-                  // Fill missing players with empty answers
-                  for (const p of room.players.values()) {
-                    if (p.submittedAnswers === null) {
-                      p.submittedAnswers = {
-                        name: '',
-                        animal: '',
-                        plant: '',
-                        object: '',
-                        country: '',
-                      };
-                    }
-                  }
-
-                  calculateRoundScores(room);
-                  room.stage = 'ROUND_RESULTS';
-                  broadcastRoom(room);
-                } else {
-                  // Broadcast countdown tick (5, 4, 3, 2, 1)
-                  broadcastRoom(room);
-                }
-              }, 1000);
-            } else {
-              // Countdown is already active, simply broadcast updated submission count
-              broadcastRoom(room);
-            }
-            break;
-          }
-
-          case 'HOST_FORCE_END_ROUND': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.hostId !== meta.playerId) return;
-
-            clearRoomCountdown(room);
-
-            // Fill unsubmitted with empty
-            for (const p of room.players.values()) {
-              if (p.submittedAnswers === null) {
-                p.submittedAnswers = {
-                  name: '',
-                  animal: '',
-                  plant: '',
-                  object: '',
-                  country: '',
-                };
               }
             }
-
-            calculateRoundScores(room);
-            room.stage = 'ROUND_RESULTS';
-            broadcastRoom(room);
             break;
           }
-
-          case 'HOST_ADJUST_SCORE': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.hostId !== meta.playerId) return;
-
-            const { targetPlayerId, category, newPoints } = payload;
-            const pScore = room.roundScores[targetPlayerId];
-            const player = room.players.get(targetPlayerId);
-
-            if (pScore && player && [0, 5, 10].includes(newPoints)) {
-              const oldPoints = pScore.answers[category as CategoryKey]?.points || 0;
-              const delta = newPoints - oldPoints;
-              
-              pScore.answers[category as CategoryKey].points = newPoints;
-              pScore.answers[category as CategoryKey].status = 'MANUAL';
-              pScore.answers[category as CategoryKey].reason = `تم التعديل بواسطة المالك (${newPoints > 0 ? '+' + newPoints : 0})`;
-              
-              pScore.roundTotal += delta;
-              player.totalScore += delta;
-
-              broadcastRoom(room);
-            }
-            break;
-          }
-
-          case 'HOST_NEXT_ROUND': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.hostId !== meta.playerId) return;
-
-            clearRoomCountdown(room);
-
-            // Check if someone reached target score
-            const hasWinner = Array.from(room.players.values()).some(p => p.totalScore >= room.targetScore);
-            if (hasWinner) {
-              room.stage = 'GAME_OVER';
-              broadcastRoom(room);
-              return;
-            }
-
-            // Next round
-            room.currentRound += 1;
-            room.letterPickerIndex = (room.letterPickerIndex + 1) % (room.players.size || 1);
-            room.currentLetter = null;
-            room.stage = 'CHOOSING_LETTER';
-
-            for (const p of room.players.values()) {
-              p.submittedAnswers = null;
-            }
-
-            broadcastRoom(room);
-            break;
-          }
-
-          case 'RESTART_GAME': {
-            const meta = socketMetadata.get(ws);
-            if (!meta) return;
-            const room = rooms.get(meta.roomCode);
-            if (!room || room.hostId !== meta.playerId) return;
-
-            clearRoomCountdown(room);
-            room.stage = 'LOBBY';
-            room.currentRound = 1;
-            room.letterPickerIndex = 0;
-            room.currentLetter = null;
-            room.usedLetters = [];
-            room.roundScores = {};
-
-            for (const p of room.players.values()) {
-              p.totalScore = 0;
-              p.submittedAnswers = null;
-            }
-
-            broadcastRoom(room);
-            break;
-          }
-
-          default:
-            break;
         }
       } catch (err) {
         console.error('WebSocket message parsing error:', err);
