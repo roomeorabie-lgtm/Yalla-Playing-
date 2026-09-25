@@ -1,0 +1,6 @@
+{
+  "name": "بنات العيلة - لعبة الكلمات الجماعية أونلاين",
+  "description": "لعبة بنات العيلة الجماعية أونلاين - ولد، بنت، حيوان، نبات، جماد، بلد بحروف الأبجدية والتنافس المباشر مع العائلة والأصدقاء.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
